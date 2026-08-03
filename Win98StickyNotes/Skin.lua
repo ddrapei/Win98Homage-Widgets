@@ -1,5 +1,5 @@
 -- ============================================================================
---  Skin.lua  --  brain for the Win98 Sticky Note skin  (v2.0)
+--  Skin.lua  --  brain for the Win98 Sticky Note skin  (v2.1)
 --
 --  Same bargain as the Resource Meter: the .ini stays pure layout, everything
 --  this script computes is pushed out as a Rainmeter variable, and the meters
@@ -61,6 +61,22 @@
 --    None of them takes the mouse: one rectangle over the paper does that for
 --    the lot, and Click() below works out from the x whether it landed in the
 --    margin (flip the box) or on the text (edit the line).
+--
+--  Where a click lands, and the one thing to get right about it
+--    $MOUSEX$ and $MOUSEY$ are relative to the METER carrying the action, not
+--    to the skin.  [MeterPaper] does not sit at the skin's origin -- it sits
+--    at (Pad + PaperX, Pad + PaperY) -- so a click arriving here is short by
+--    the paper's own offset, and nothing in the numbers says so: they are
+--    small positive pixel counts either way, and a wrong one still picks a
+--    row, just not the row under the pointer.
+--
+--    So the conversion is done once, in fromPaper() and fromTrough(), out of
+--    the same PaperX/PaperY/TroughY the .ini positions those two meters with.
+--    Read from one place, they cannot drift apart.  And note what drops out
+--    of the arithmetic: the meter's own X already contains Pad, so Pad
+--    cancels, and this script never needs to know the skin has a margin at
+--    all.  Every coordinate below is measured from the corner of the window,
+--    which is where the layout figures in the .ini are measured from too.
 --
 --  Performance
 --    Per tick: one small file read, and a string compare against the bytes
@@ -144,7 +160,6 @@ local raw    = {}             -- the file's lines, exactly as they came in
 local items  = {}             -- logical lines: text, checkbox state, and which
                               -- line of raw each came from
 local rows   = {}             -- items wrapped into rows, all of them
-local first  = {}             -- raw line number -> the row it starts on
 local top    = 1              -- index in rows of the topmost visible row
 local thumb  = { y = 0, h = 0 }
 
@@ -338,27 +353,18 @@ local function parse(text)
 end
 
 -- Every item, wrapped, in one flat list: the row meters show a window onto it.
--- first[] is the way back -- from a line of the file to the row it starts on,
--- which is what puts the input box over the right row.
+-- An item that wraps owns two or three rows; head marks the first of them,
+-- which is the only one that gets a checkbox and the only one that can be
+-- clicked to flip it.
 local function layout()
-    rows, first = {}, {}
+    rows = {}
     for i = 1, #items do
         local item   = items[i]
         local pieces = wrap(item.text, item.indent, note.textW - SLACK)
         for j = 1, #pieces do
             rows[#rows + 1] = { text = pieces[j], item = i, head = (j == 1) }
-            if j == 1 and item.line then first[item.line] = #rows end
         end
     end
-end
-
--- Where a new line goes: the first blank line at the end of the file, or one
--- past the end if there is none.  Reusing a trailing blank stops them piling
--- up every time an edit is abandoned.
-local function tail()
-    local n = #raw
-    while n > 0 and raw[n]:match('^%s*$') do n = n - 1 end
-    return n + 1
 end
 
 -- How many words the note runs to.  Counted off the items rather than off the
@@ -396,13 +402,14 @@ end
 -- what is on screen is what is in the file, with no second copy of the rules
 -- for keeping the two in step.
 local function rewrite()
-    -- One newline at the end and no more.  Appending at tail() eats the blank
-    -- element a trailing newline leaves behind, so without this a note would
-    -- quietly lose its last line ending the first time anything was added to
-    -- the end of it.
-    if raw[#raw] ~= '' then raw[#raw + 1] = '' end
-
+    -- One newline at the end and no more.  It goes on the text rather than
+    -- into raw, so that a write which fails leaves raw exactly as the caller
+    -- left it -- the caller's rollback is then a plain assignment, with no
+    -- stray blank line to undo as well.  parse() puts the element back when
+    -- the write succeeds, which is what keeps the terminator from doubling.
     local text = table.concat(raw, eol)
+    if raw[#raw] ~= '' then text = text .. eol end
+
     local f = io.open(path, 'wb')
     if not f then return false end
     f:write(text)
@@ -429,6 +436,23 @@ end
 --  Rendering
 --  ============================================================================
 
+-- The item whose checkbox is drawn against this row, or nil if the row shows
+-- no box at all.
+--
+-- Two things ask this and they have to give the same answer: render(), which
+-- decides where a box appears, and the click that flips one.  When they were
+-- allowed to decide separately the click was the more generous of the two --
+-- it would flip an item from any of its rows, including the wrapped ones with
+-- nothing but blank margin beside them, so a click on empty paper ticked
+-- something a line or two up.  Asked here, there is only one rule and only one
+-- place to change it.
+local function boxOn(row)
+    if not (row and row.head) then return nil end
+    local item = items[row.item]
+    if not (item and item.todo) then return nil end
+    return item
+end
+
 -- The window of rows, the scrollbar that says where it is, and the row count.
 -- Called after anything that could have moved something: an edit, a scroll,
 -- a click.
@@ -449,6 +473,7 @@ local function render()
         local n    = tostring(slot)
         local row  = rows[top + slot - 1]
         local item = row and items[row.item]
+        local box  = not editing and boxOn(row) or nil
         local done = (item and item.done) or false
         local text = row and row.text or ''
         local y    = note.firstY + (slot - 1) * note.pitch
@@ -462,10 +487,8 @@ local function render()
         -- every other tick and would otherwise put them all back mid-edit.
         set('Row'    .. n, text, GROUP)
         set('RowInk' .. n, done and ink.faded or ink.text, GROUP)
-        set('Box'    .. n, (not editing and item and item.todo and row.head)
-                           and '0' or '1', GROUP)
-        set('Tick'   .. n, (not editing and done and row.head)
-                           and ink.text or CLEAR, GROUP)
+        set('Box'    .. n, box and '0' or '1', GROUP)
+        set('Tick'   .. n, (box and box.done) and ink.text or CLEAR, GROUP)
 
         if done and text ~= '' then
             local w = width(text)
@@ -570,25 +593,25 @@ end
 --  ============================================================================
 
 function Initialize()
+    -- All in frame coordinates -- measured from the corner of the window, the
+    -- same origin the .ini's own figures are measured from.  Pad is not here
+    -- and does not belong here: see fromPaper() for why it cancels.
     note = {
         rows    = number('Rows', 12),
         pitch   = number('RowPitch', 13),
         firstY  = number('Row1Y', 30),
         textX   = number('TextX', 22),
         textW   = number('TextW', 146),
-        troughY = number('TroughY', 40),
-        troughH = number('TroughH', 136),
-        titleX  = number('TitleX', 24),
-        titleY  = number('TitleY', 6),
-        titleW  = number('TitleW', 125),
-        pad     = number('Pad', 12),
+        paperX  = number('PaperX', 8),      -- the corner [MeterPaper] reports
+        paperY  = number('PaperY', 29),     -- its clicks from
+        troughY = number('TroughY', 40),    -- and [MeterTrough]'s, which is
+        troughH = number('TroughH', 136),   -- also the top of the trough
     }
     if note.rows < 1 then note.rows = 1 end
 
     scale     = number('FontSize', 8) / 8
     ink.text  = SKIN:GetVariable('Ink', '28,22,14')
     ink.faded = SKIN:GetVariable('Shadow', '116,105,88')
-    ink.title = SKIN:GetVariable('TitleInk', '247,238,224')
     filename  = SKIN:GetVariable('NoteFile', FILE)
 
     local here = SKIN:GetVariable('CURRENTPATH', '')
@@ -635,6 +658,28 @@ local function busy()
     return editing
 end
 
+-- $MOUSEX$ and $MOUSEY$ arrive relative to the meter that took the click, so
+-- a point from [MeterPaper] is short by the paper's own corner and a y from
+-- [MeterTrough] is short by the trough's.  These two put them back, out of
+-- the same variables the .ini positions those meters with.
+--
+-- Pad is deliberately absent.  The meter's X is (Pad + PaperX) and the click
+-- comes in relative to that, so the margin round the window has already been
+-- subtracted twice over by the time the number gets here -- once by
+-- Rainmeter, once by the meter's own placement -- and adding PaperX back is
+-- the whole of the conversion.  Nothing in this script has to know Pad
+-- exists, and it should stay that way: the version that did know reached for
+-- Pad here instead of PaperX, and every checkbox in the note answered three
+-- rows above the pointer.
+local function fromPaper(x, y)
+    return (tonumber(x) or 0) + note.paperX,
+           (tonumber(y) or 0) + note.paperY
+end
+
+local function fromTrough(y)
+    return (tonumber(y) or 0) + note.troughY
+end
+
 -- The arrows and the wheel: a row at a time.
 function Scroll(by)
     if busy() then return '' end
@@ -656,10 +701,14 @@ function Scroll(by)
     return ''
 end
 
--- A click in the trough, handed the pointer's y in skin coordinates: page
--- towards it, or sit still if it landed on the thumb.
+-- A click in the trough: page towards it, or sit still if it landed on the
+-- thumb.  thumb.y is a frame coordinate, so the pointer has to become one
+-- before the two can be compared -- which is what went wrong here as well as
+-- on the paper, and with the same result each time: every click read as being
+-- above the thumb, so the trough would only ever page upwards.
 function Page(y)
-    y = (tonumber(y) or 0) - note.pad
+    if busy() then return '' end
+    y = fromTrough(y)
     if y >= thumb.y and y < thumb.y + thumb.h then return '' end
 
     local page = note.rows - PAGE_KEEP
@@ -667,14 +716,16 @@ function Page(y)
     return Scroll(y < thumb.y and -page or page)
 end
 
--- Flip a row's checkbox.  The file is where the state lives, so it is written
--- first: if the write fails nothing moves and the panel says why until the
--- next tick puts it back.
-function Toggle(slot)
-    if busy() then return '' end
-    local row  = rows[top + (tonumber(slot) or 0) - 1]
-    local item = row and items[row.item]
-    if not (item and item.todo) then return '' end
+-- Flip the checkbox on one of the twelve visible rows.  The file is where the
+-- state lives, so it is written first: if the write fails nothing moves and
+-- the panel says why until the next tick puts it back.
+--
+-- Rows with no box on them are not an error and not a miss -- prose has a
+-- margin too, and so does the second row of an item that wrapped.  A click
+-- there is simply a click on blank paper, and this says so by doing nothing.
+local function toggle(slot)
+    local item = boxOn(rows[top + slot - 1])
+    if not item then return end
 
     local line   = item.line
     local before = raw[line]
@@ -685,29 +736,31 @@ function Toggle(slot)
     if not rewrite() then
         raw[line] = before
         say('read-only')
-        render()
-        flush()
-        return ''
     end
-
-    render()
-    flush()
-    return ''
 end
 
--- Every click on the paper arrives here, as a point.  Left of the text column
--- is the margin, where the checkboxes are: that flips the row's checkbox.
--- Anywhere else on the paper opens the note for editing.
+-- Every click on the paper arrives here, as a point relative to the paper.
+-- Left of the text column is the margin, where the checkboxes are: that flips
+-- the row's checkbox.  Anywhere else on the paper opens the note for editing.
 function Click(x, y)
     if busy() then return '' end
-    local fx = (tonumber(x) or 0) - note.pad
-    local fy = (tonumber(y) or 0) - note.pad
+    local fx, fy = fromPaper(x, y)
 
+    -- Which of the twelve rows the point fell in.  The paper stands a pixel
+    -- proud of the rows at the top and at the foot, so this can come out as 0
+    -- or 13: those two slivers belong to the row they touch, which is what
+    -- the clamp is for and all it is for.  It is not there to make a wild
+    -- answer safe -- it did that once, and quietly.
     local slot = math.floor((fy - note.firstY) / note.pitch) + 1
     if slot < 1         then slot = 1 end
     if slot > note.rows then slot = note.rows end
 
-    if fx < note.textX then return Toggle(slot) end
+    if fx < note.textX then
+        toggle(slot)
+        render()
+        flush()
+        return ''
+    end
 
     openSheet()
     return ''
