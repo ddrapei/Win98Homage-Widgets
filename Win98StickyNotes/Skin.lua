@@ -1,5 +1,5 @@
 -- ============================================================================
---  Skin.lua  --  brain for the Win98 Sticky Note skin  (v2.1)
+--  Skin.lua  --  brain for the Win98 Sticky Note skin  (v3.0)
 --
 --  Same bargain as the Resource Meter: the .ini stays pure layout, everything
 --  this script computes is pushed out as a Rainmeter variable, and the meters
@@ -9,8 +9,8 @@
 --  Responsibilities
 --    notes      read Notes.txt, wrap it to the note's column, and hand the
 --               rows that fit to the twelve row meters
---    editing    a click on a line puts a text box over it and writes what
---               comes back; Enter carries on down the note
+--    editing    a click on the text hands the sheet to the NoteEdit plugin,
+--               and re-reads the file when it hands it back
 --    checklist  a line that opens with [ ] or [x] is an item: it gets a
 --               checkbox, and clicking it flips the marker and writes the
 --               file back
@@ -22,25 +22,25 @@
 --               how many rows it runs to
 --
 --  How editing works, and why it works that way
---    Rainmeter has no keyboard of its own; the InputText plugin is the whole
---    of it, and what it gives you is one floating single-line box.  So there
---    is no caret living in the note between keystrokes -- what there is
---    instead is a box that appears exactly over the line you clicked, holding
---    exactly that line, and Enter writes it back and opens the next one.  In
---    use that comes to the same thing: click, type, Enter, type, Enter, and
---    Escape when you are done.
+--    Rainmeter has no keyboard of its own, and the plugin it ships for one,
+--    InputText, is a prompt: it gives its text back on Enter and throws it
+--    away on a click anywhere else, which is the opposite of a sticky note.
+--    So the keyboard is NoteEdit, the plugin in @Plugin beside this script,
+--    and it owns the whole of an edit: it reads Notes.txt into a real edit
+--    box laid over the sheet, writes it back as you type, and writes it again
+--    and closes when you click anywhere else.  Enter is a new line.
 --
---    What the box holds is the file's own line, brackets and all, not a
---    prettied-up version of it.  That is deliberate.  It makes the write
---    back a single assignment with no cases to get wrong, it shows the
---    checkbox syntax to anyone who wonders where the boxes come from, and it
---    means every edit the file format allows is reachable from the note:
---    type "[ ] " in front of a line to make it an item, take it off to make
---    it prose again, change the indent, empty the line to delete it.
+--    That leaves this script two jobs.  openSheet() says which line is at the
+--    top of the view, so the box opens showing what the sheet was showing,
+--    and Closed() re-reads the file once the box has gone.  In between it
+--    keeps its hands off: the file is the plugin's until Closed().
 --
---    The typed text is read back off the measure rather than out of
---    $UserInput$.  A bang carrying a line with a quote in it does not
---    survive the trip; GetStringValue does.
+--    What the box holds is the file itself, brackets and all, not a
+--    prettied-up version of it.  That is deliberate: it shows the checkbox
+--    syntax to anyone who wonders where the boxes come from, and it means
+--    every edit the file format allows is reachable from the note -- type
+--    "[ ] " in front of a line to make it an item, take it off to make it
+--    prose again, change the indent, empty the line to delete it.
 --
 --  How the text is laid out
 --    Rainmeter can wrap a string itself, but a string it wrapped is one meter
@@ -52,6 +52,20 @@
 --    query, so SLACK is held back from every line and the row meters are
 --    clipped to the column: a line it measures short ends in an ellipsis
 --    instead of running into the scrollbar.
+--
+--  Characters
+--    The note is UTF-8, and this script is not a Unicode script, so Rainmeter
+--    would take any byte over 127 handed to it for the ANSI code page.  Two
+--    things follow.  Measuring and wrapping step a character at a time rather
+--    than a byte at a time, so a row is never cut through the middle of one.
+--    And display() spells every character past ASCII as a Rainmeter character
+--    reference, [\xHHHH], which is plain ASCII on the way in and the right
+--    character on the way out, whatever the code page.
+--
+--    A note from before the skin was UTF-8 was written in Windows-1252, and is
+--    not valid UTF-8.  Such a file is read as 1252 throughout -- the same way,
+--    and with the same table, as the NoteEdit plugin reads it -- until its
+--    first edit writes it back as UTF-8.
 --
 --  How a checkbox is drawn
 --    Backwards, like the sibling's bars.  All twelve ticks are in the .ini,
@@ -107,8 +121,6 @@ local THUMB_MIN = 11          -- px: the thumb never gets shorter than the
                               -- arrow buttons it runs between
 local PAGE_KEEP = 1           -- rows a page-click leaves on screen, the way
                               -- Windows pages by a screenful less a line
-local BACKUP    = '.bak'      -- suffix of the copy kept beside the note, one
-                              -- edit behind, in case a commit goes wrong
 local DATE      = '%d %b %Y'  -- how the first run stamps Created
 local SWATCHES  = 2           -- how many papers the swatch button cycles
 local GROUP     = 'Note'      -- the meter group holding everything that
@@ -118,14 +130,16 @@ local PAPER     = 'Paper'     -- and the one holding everything that changes
 
 --  ---- advance widths --------------------------------------------------------
 --  Microsoft Sans Serif at 8 pt, in pixels, by eye.  Anything not listed is
---  DEFAULT wide, which is the width of a digit.  Scaled at load by
---  FontSize / 8, so a bigger font still wraps in the right place.
+--  DEFAULT wide, which is the width of a digit -- and so is every character
+--  past ASCII, which is near enough for Latin and Cyrillic letters.  Keyed by
+--  code point.  Scaled at load by FontSize / 8, so a bigger font still wraps
+--  in the right place.
 
 local DEFAULT = 6
 local WIDTH   = {}
 
 local function widths(px, chars)
-    for c in chars:gmatch('.') do WIDTH[c] = px end
+    for i = 1, #chars do WIDTH[chars:byte(i)] = px end
 end
 
 widths(2,  "il|'!.,:;")
@@ -137,7 +151,7 @@ widths(7,  'ABEKPSVXYZ')
 widths(8,  'CDGHNOQRTUw&')
 widths(9,  'm%')
 widths(10, 'MW@')
-WIDTH[' '] = 4
+WIDTH[32] = 4                 -- the space
 
 --  ---- state -----------------------------------------------------------------
 
@@ -156,6 +170,9 @@ local source = false          -- the bytes last parsed.  false is "not read
                               -- yet", which nil -- "no such file" -- must not
                               -- be mistaken for
 local eol    = '\n'           -- the line ending the file arrived with
+local legacy = false          -- the file is Windows-1252, not UTF-8
+local BOM    = '\239\187\191' -- the UTF-8 byte-order mark
+local bom    = ''             -- and whether the file starts with one
 local raw    = {}             -- the file's lines, exactly as they came in
 local items  = {}             -- logical lines: text, checkbox state, and which
                               -- line of raw each came from
@@ -168,6 +185,8 @@ local colour  = 1             -- which one the note is on
 local created = ''            -- the date in the left status panel
 
 local editing = false         -- whether the sheet is open for editing
+local unsaved = false         -- whether the plugin is holding typing it could
+                              -- not write: see Closed()
 
 
 -- Something the panel has to say instead of the position -- that a write was
@@ -233,12 +252,103 @@ local function expand(s)
     return (s:gsub('\t', string.rep(' ', TAB)))
 end
 
+-- Windows-1252's 0x80..0x9F, the one block where it is not Latin-1.  The
+-- five bytes 1252 leaves undefined are absent, and so stand for themselves.
+local CP1252 = {
+    [0x80] = 0x20AC, [0x82] = 0x201A, [0x83] = 0x0192, [0x84] = 0x201E,
+    [0x85] = 0x2026, [0x86] = 0x2020, [0x87] = 0x2021, [0x88] = 0x02C6,
+    [0x89] = 0x2030, [0x8A] = 0x0160, [0x8B] = 0x2039, [0x8C] = 0x0152,
+    [0x8E] = 0x017D, [0x91] = 0x2018, [0x92] = 0x2019, [0x93] = 0x201C,
+    [0x94] = 0x201D, [0x95] = 0x2022, [0x96] = 0x2013, [0x97] = 0x2014,
+    [0x98] = 0x02DC, [0x99] = 0x2122, [0x9A] = 0x0161, [0x9B] = 0x203A,
+    [0x9C] = 0x0153, [0x9E] = 0x017E, [0x9F] = 0x0178,
+}
+
+-- The UTF-8 character that starts at byte i of s: its code point and the
+-- byte after it, or nil if what starts there is not UTF-8.
+local function utf8At(s, i)
+    local c = s:byte(i)
+    if c < 0x80 then return c, i + 1 end
+    local n, cp
+    if     c >= 0xC2 and c <= 0xDF then n, cp = 1, c - 0xC0
+    elseif c >= 0xE0 and c <= 0xEF then n, cp = 2, c - 0xE0
+    elseif c >= 0xF0 and c <= 0xF4 then n, cp = 3, c - 0xF0
+    else return nil end
+    for k = i + 1, i + n do
+        local b = s:byte(k)
+        if not b or b < 0x80 or b > 0xBF then return nil end
+        cp = cp * 64 + (b - 0x80)
+    end
+    return cp, i + n + 1
+end
+
+local function isUtf8(s)
+    if not s:find('[\128-\255]') then return true end
+    local i = 1
+    while i <= #s do
+        local _, after = utf8At(s, i)
+        if not after then return false end
+        i = after
+    end
+    return true
+end
+
+-- Every character of s, as (first byte, last byte, code point).  The file was
+-- checked as a whole when it was parsed, so a stray invalid byte in a UTF-8
+-- note can only be damage, and reads as the replacement character.
+local function chars(s)
+    local i = 1
+    return function()
+        if i > #s then return nil end
+        local from, cp, after = i, nil, nil
+        if legacy then
+            cp, after = s:byte(i), i + 1
+            cp = CP1252[cp] or cp
+        else
+            cp, after = utf8At(s, i)
+            if not cp then cp, after = 0xFFFD, i + 1 end
+        end
+        i = after
+        return from, after - 1, cp
+    end
+end
+
 local function width(s)
     local total = 0
-    for i = 1, #s do
-        total = total + (WIDTH[s:sub(i, i)] or DEFAULT)
+    for _, _, cp in chars(s) do
+        total = total + (WIDTH[cp] or DEFAULT)
     end
     return math.floor(total * scale + 0.5)
+end
+
+-- Where to cut s so that its head fits in room px: the last byte of the last
+-- whole character that fits, and never less than the first character.
+local function fit(s, room)
+    local total, cut = 0, 0
+    for _, last, cp in chars(s) do
+        total = total + (WIDTH[cp] or DEFAULT)
+        if cut > 0 and math.floor(total * scale + 0.5) > room then break end
+        cut = last
+    end
+    return cut
+end
+
+-- A row's text as Rainmeter is to be handed it.  Past ASCII, every character
+-- becomes a reference, [\xHHHH] -- see Characters, above.  So do [ and #,
+-- which are ASCII but not safe: a row reading "[Name]" would be taken for a
+-- section variable and "#Name#" for a skin variable.  A reference is resolved
+-- after both, so what it stands for is never read again.
+local function display(s)
+    if not s:find('[%[#\128-\255]') then return s end
+    local out = {}
+    for from, last, cp in chars(s) do
+        if cp < 0x80 and cp ~= 0x5B and cp ~= 0x23 then
+            out[#out + 1] = s:sub(from, last)
+        else
+            out[#out + 1] = string.format('[\\x%04X]', cp)
+        end
+    end
+    return table.concat(out)
 end
 
 -- The file's lines, split but not touched otherwise: an edit rewrites one of
@@ -288,11 +398,10 @@ local function wrap(text, indent, room)
             line = word
         end
 
-        while width(line) > room and #line > 1 do
-            local cut = #line
-            while cut > 1 and width(line:sub(1, cut)) > room do
-                cut = cut - 1
-            end
+        while width(line) > room do
+            local cut = fit(line, room)
+            if cut >= #line then break end  -- one character wider than the
+                                            -- column: it has the row to itself
             emit(line:sub(1, cut))
             line = line:sub(cut + 1)
         end
@@ -314,7 +423,7 @@ end
 -- as a heading: the window is called Notes, and a line beginning # is a row
 -- like any other.
 local function parse(text)
-    raw, items = {}, {}
+    raw, items, bom, legacy = {}, {}, '', false
 
     if text == nil then                 -- no file: say so on the paper.  These
         items[1] = { text = filename .. ' is missing.', indent = '' }
@@ -322,8 +431,13 @@ local function parse(text)
         return                          -- two items with no .line, so an edit
     end                                 -- on either appends instead
 
-    eol = text:find('\r\n', 1, true) and '\r\n' or '\n'
-    raw = lines(text)
+    eol    = text:find('\r\n', 1, true) and '\r\n' or '\n'
+    legacy = not isUtf8(text)
+    -- A UTF-8 byte-order mark is not part of the first line: kept in bom so
+    -- rewrite() can put it back, and out of raw so "[ ]" is still found at
+    -- the start of the line.
+    bom    = (text:sub(1, 3) == BOM) and BOM or ''
+    raw    = lines(text:sub(#bom + 1))
 
     for i = 1, #raw do
         local line = raw[i]
@@ -407,7 +521,7 @@ local function rewrite()
     -- left it -- the caller's rollback is then a plain assignment, with no
     -- stray blank line to undo as well.  parse() puts the element back when
     -- the write succeeds, which is what keeps the terminator from doubling.
-    local text = table.concat(raw, eol)
+    local text = bom .. table.concat(raw, eol)
     if raw[#raw] ~= '' then text = text .. eol end
 
     local f = io.open(path, 'wb')
@@ -485,7 +599,7 @@ local function render()
         -- wrapped rows the boxes were placed against.  Guarded here rather
         -- than cleared once when the box opens, because Update() comes round
         -- every other tick and would otherwise put them all back mid-edit.
-        set('Row'    .. n, text, GROUP)
+        set('Row'    .. n, display(text), GROUP)
         set('RowInk' .. n, done and ink.faded or ink.text, GROUP)
         set('Box'    .. n, box and '0' or '1', GROUP)
         set('Tick'   .. n, (box and box.done) and ink.text or CLEAR, GROUP)
@@ -516,19 +630,15 @@ local function render()
     set('UpInk',   (top > 1)    and ink.text or ink.faded, GROUP)
     set('DownInk', (top < last) and ink.text or ink.faded, GROUP)
 
-    -- The right panel counts the note's words.  Two things get to interrupt
-    -- it, in this order: something that went wrong, which is worth reading
-    -- before the count comes back, and the fact that the sheet is open --
-    -- because the one thing the plugin cannot do is save without Enter, so
-    -- while there is unsaved text in the box the panel says so instead of
-    -- counting words nobody is looking at.
+    -- The right panel counts the note's words, and keeps counting while the
+    -- sheet is open: the plugin writes the file as it is typed, and Update()
+    -- re-reads it, so the count follows the typing a tick or two behind.
+    -- Something that went wrong interrupts it, long enough to be read.
     if source == nil then
         set('Words', 'no file', GROUP)
     elseif noticeFor > 0 then
         noticeFor = noticeFor - 1
         set('Words', notice, GROUP)
-    elseif editing then
-        set('Words', 'Enter saves', GROUP)
     else
         local n = words()
         if n == 0 then
@@ -542,50 +652,61 @@ local function render()
 end
 
 --  ============================================================================
---  The input box
+--  The edit box
 --  ============================================================================
 
--- Rainmeter reads an option value before the plugin ever sees it, and an
--- option value is one line.  So the note is encoded on the way into the box:
---   [  ->  [\91]        or a line like "[x] stamps" is taken for a section
---                        variable and disappears
---   \n ->  [\13][\10]   the character variables that put the breaks back,
---                        which is what makes the box multi-line at all
-local function encode(text)
-    return (text:gsub('%[', '[\\91]'):gsub('\r?\n', '[\\13][\\10]'))
+local EDITOR = 'MeasureInput'
+
+-- What the plugin says about the box: open, saved, unchanged, write-error,
+-- read-error or no-window.  Nothing at all if the plugin is not there.
+local function editorSays()
+    local box = SKIN:GetMeasure(EDITOR)
+    return box and box:GetStringValue() or ''
 end
 
--- Hand the whole sheet to one edit box, sized to the paper.  This is the
--- change that makes the note behave like a text field: the caret, the
+-- Hand the whole sheet to one edit box, sized to the paper.  The caret, the
 -- selection, the deleting and the copying are all the Windows edit control's
--- own, not twelve separate prompts pretending to be a document.
+-- own, and the caret lands where the click did.
 --
--- Enter commits, CTRL-Enter starts a line, Escape walks away.  The text
--- arrives selected -- the plugin does that and there is no option to stop it
--- -- so the first click inside the box is what puts the caret down.
+-- The box is told which line of the file is at the top of the view, and how
+-- many wrapped rows down into it, so it opens scrolled to what the sheet was
+-- showing rather than to the top of the note.  Everything else about it --
+-- where it sits, its size, its colours, the file -- is written once in the
+-- .ini, where they are the sheet's own figures: SolidColor there is #NoteBg#,
+-- the variable the paper is painted with, and the plugin reads it as it opens.
 local function openSheet()
     editing = true
-    render()        -- clears the margin and puts "Enter saves" in the panel
+    render()        -- clears the margin: see render()
     flush()
 
-    -- Only the text is set from here.  The box's position, its size and its
-    -- colours are written once in the .ini, where they are the sheet's own
-    -- figures -- so there is nothing to move, nothing to repaint, and no way
-    -- for the box to come up somewhere the note is not, or in a colour the
-    -- note is not.  SolidColor there is #NoteBg#, the same variable the paper
-    -- is painted with, which is what keeps the two the same shade.
-    local m = 'MeasureInput'
-    SKIN:Bang('!SetOption', m, 'DefaultValue', encode(table.concat(raw, '\n')))
-    SKIN:Bang('!CommandMeasure', m, 'ExecuteBatch 1-2')
+    local line, down = 1, 0
+    local row = rows[top]
+    if row then
+        line = items[row.item].line or 1
+        while down < top - 1 and rows[top - down - 1].item == row.item do
+            down = down + 1
+        end
+    end
+    SKIN:Bang('!CommandMeasure', EDITOR, string.format('Open %d %d', line, down))
+
+    -- Open is answered before the bang returns: either the box is up, or the
+    -- plugin has already called Closed() to say why not.  Neither having
+    -- happened means there is no plugin to answer -- NoteEdit.dll is not
+    -- installed -- and the sheet has to come back now, or every checkbox
+    -- stays hidden and every click waits on a Closed() that never comes.
+    if editing and editorSays() ~= 'open' then
+        editing = false
+        say('no editor')
+        render()
+        flush()
+    end
 end
 
--- One edit behind, beside the note.  The commit below refuses the write it
--- cannot trust, so this is belt and braces -- but it is a text file someone
--- keeps their life in, and a copy costs nothing.
-local function backup()
-    if not source then return end
-    local f = io.open(path .. BACKUP, 'wb')
-    if f then f:write(source); f:close() end
+-- Finish the edit from this side: the same as a click outside the box.  For
+-- a click on the skin itself, in case Windows did not already count it as
+-- one -- the plugin answers with Closed(), which is what puts things back.
+local function leave()
+    SKIN:Bang('!CommandMeasure', EDITOR, 'Close')
 end
 
 --  ============================================================================
@@ -646,14 +767,13 @@ end
 
 --  ---- called from the .ini --------------------------------------------------
 
--- While the sheet is open, the parts of the skin the box does not cover -- the
--- margin gutter to its left and the scrollbar to its right -- can be clicked
--- for the first time: FocusDismiss=0 means such a click no longer dismisses the
--- box, so it arrives here instead with an edit still in flight.  None of it
--- should do anything.  A toggle would rewrite the file underneath text the box
--- is still holding, and the following Enter would undo the toggle; a scroll
--- would move rows that are behind the box and nobody is looking at; a second
--- click on the paper would open a second box over the first.
+-- While the sheet is open, the file is the plugin's.  A click on the skin
+-- normally finishes the edit before it gets here -- clicking the skin takes
+-- the focus from the box, and the box saves and closes on losing it -- but a
+-- click that arrives with the sheet still open must not act on it: a toggle
+-- would rewrite the file under text the box is about to write back, and a
+-- scroll would move rows nobody can see.  So it finishes the edit instead,
+-- and the next click does what this one would have.
 local function busy()
     return editing
 end
@@ -707,7 +827,7 @@ end
 -- on the paper, and with the same result each time: every click read as being
 -- above the thumb, so the trough would only ever page upwards.
 function Page(y)
-    if busy() then return '' end
+    if busy() then leave() return '' end
     y = fromTrough(y)
     if y >= thumb.y and y < thumb.y + thumb.h then return '' end
 
@@ -743,7 +863,7 @@ end
 -- Left of the text column is the margin, where the checkboxes are: that flips
 -- the row's checkbox.  Anywhere else on the paper opens the note for editing.
 function Click(x, y)
-    if busy() then return '' end
+    if busy() then leave() return '' end
     local fx, fy = fromPaper(x, y)
 
     -- Which of the twelve rows the point fell in.  The paper stands a pixel
@@ -756,7 +876,7 @@ function Click(x, y)
     if slot > note.rows then slot = note.rows end
 
     if fx < note.textX then
-        toggle(slot)
+        if unsaved then say('not saved') else toggle(slot) end
         render()
         flush()
         return ''
@@ -766,77 +886,38 @@ function Click(x, y)
     return ''
 end
 
--- Enter was pressed.  The typed text is read off the measure rather than
--- taken from the bang: a bang carrying a quote does not arrive whole, and a
--- Rainmeter variable cannot hold a line break at all, which would flatten the
--- note on its way back.
-function Commit()
-    if not editing then return '' end
+-- What the panel says after a box that did not end well.  Each says what
+-- actually happened: a note that could not be read was never typed in, so it
+-- is not "not saved".
+local TROUBLE = {
+    ['write-error'] = 'not saved',
+    ['read-error']  = 'cannot read',
+    ['no-window']   = 'no editor',
+}
+
+-- The box has closed -- a click somewhere else, Escape, the skin being
+-- clicked -- and the plugin has already written the file.  Or it never
+-- opened, and the plugin is saying why.  Either way: read the file back, put
+-- the checkboxes back in the margin, and say so if something went wrong.
+--
+-- A refused write is the one that lingers.  The plugin keeps the typing it
+-- could not save and shows it again the next time the sheet opens -- so it is
+-- not lost, but it is not on disk either, and a checkbox ticked in the
+-- meantime would be written to a file that the typing then overwrites.  So
+-- the checkboxes wait (see Click) until a close says the typing is saved.
+function Closed()
     editing = false
-
-    local box   = SKIN:GetMeasure('MeasureInput')
-    local typed = box and box:GetStringValue() or ''
-
-    -- Keep a copy: if the disk says no, the note goes back to what it was.
-    local snapshot = {}
-    for i = 1, #raw do snapshot[i] = raw[i] end
-
-    local edited = lines(typed)
-
-    -- The one failure worth guarding.  If a Windows or Rainmeter version
-    -- hands the text back with its line breaks stripped, a note comes home
-    -- as a single run-on line -- and writing that would take the whole file
-    -- with it.  Flattening keeps the characters and loses only the breaks,
-    -- so the tell is a single line nearly as long as the whole note; someone
-    -- who selects all and types one short line means it, and is let through.
-    local whole = #(source or '')
-    if #snapshot > 2 and #edited == 1 and #typed * 10 >= whole * 6 then
-        say('not saved')
-        render()
-        flush()
-        return ''
+    local status = editorSays()
+    if status == 'write-error' then
+        unsaved = true
+    elseif status == 'saved' or status == 'unchanged' then
+        unsaved = false
     end
-
-    backup()
-    raw = edited
-
-    if not rewrite() then
-        raw = snapshot
-        say('read-only')
-        render()
-        flush()
-        return ''
-    end
-
+    if TROUBLE[status] then say(TROUBLE[status]) end
+    reload()
     render()
     flush()
     return ''
-end
-
--- The box went away without Enter -- Escape, or a click outside it.
---
--- There is nothing to save here and no way to get it.  The plugin only ever
--- assigns the measure a value when the box is submitted; dismissed, the
--- measure still holds the text from the *previous* commit, so a Commit() from
--- this path would not rescue the edit, it would write the note back as it was
--- before the edit and call it saved.  That is worse than losing the typing,
--- so this does not try.
---
--- What it does instead is say so.  Losing a few lines is annoying; losing
--- them without being told is how someone comes back an hour later and finds
--- the note short.  The file is untouched, and Notes.txt.bak is still one
--- commit behind if the last saved version is wanted.
-function Dismiss()
-    editing = false
-    say('not saved')
-    render()                    -- puts the checkboxes back
-    flush()
-    return ''
-end
-
--- The name this used to have, kept so an older .ini still finds something.
-function Cancel()
-    return Dismiss()
 end
 
 -- The swatch button.  Two papers and one button, so a click swaps them:
@@ -844,6 +925,7 @@ end
 -- is the only way a colour change is reliable every single time.  The choice
 -- is written back into the skin's own .ini so it survives a refresh.
 function NextPaper()
+    if busy() then leave() return '' end
     colour = (colour % SWATCHES) + 1
     paint()
     SKIN:Bang('!WriteKeyValue', 'Variables', 'Colour', tostring(colour), ini)

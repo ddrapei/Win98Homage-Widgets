@@ -1,0 +1,24 @@
+# NoteEdit -- the sticky note's keyboard.  A Rainmeter plugin that puts a real
+# multi-line edit box over the note and saves it the way a sticky note does:
+# as you type, and when you click anywhere else.  No dependencies; the Win32
+# and Rainmeter declarations it needs are written out in src/ffi.rs.
+#
+#   cargo build --release     ->  target/release/noteedit.dll
+#
+# Copy the DLL to %APPDATA%\Rainmeter\Plugins\ (Rainmeter has to be closed, or
+# at least not have the skin loaded, to replace one that is in use).
+
+[package]
+name = "noteedit"
+version = "1.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"   # a panic cannot unwind into Rainmeter anyway; say so up front
+strip = true

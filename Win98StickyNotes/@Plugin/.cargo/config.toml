@@ -1,0 +1,4 @@
+# Static CRT: the DLL then needs nothing beyond what every Windows install and
+# Rainmeter itself already have -- no Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
